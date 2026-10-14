@@ -12,7 +12,7 @@ on:
         type: string
 
 env:
-  DH_IMAGE: doubletap-dave/orukeet-server
+  DH_IMAGE: topiary/orukeet-server
   GHCR_IMAGE: ghcr.io/doubletap-dave/orukeet-server
 
 jobs:
@@ -66,6 +66,23 @@ jobs:
           fi
           echo "is_latest=${IS_LATEST}" >> "$GITHUB_OUTPUT"
 
+          # Model build args: only override the Dockerfile's pinned model on
+          # real version builds (tags, manual dispatch). Edge builds (plain
+          # pushes to main) must NOT pass them — "orukeet-vedge.nemo" does not
+          # exist on HuggingFace and the download 404s, failing the build.
+          # Edge builds use the Dockerfile defaults, which track main's pins.
+          if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            BUILD_ARGS="ORUKEET_MODEL_ID=orukeet-v${MODEL_VERSION}
+          ORUKEET_HF_FILE=orukeet-v${MODEL_VERSION}.nemo"
+          else
+            BUILD_ARGS=""
+          fi
+          {
+            echo 'build_args<<EOF'
+            echo "${BUILD_ARGS}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
           # Build the tag list for docker/metadata-action.
           TAGS="${{ env.DH_IMAGE }}:${VERSION},${{ env.GHCR_IMAGE }}:${VERSION}"
           if [[ "${IS_LATEST}" == "true" ]]; then
@@ -82,9 +99,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.version.outputs.tags }}
-          build-args: |
-            ORUKEET_MODEL_ID=orukeet-v${{ steps.version.outputs.model_version }}
-            ORUKEET_HF_FILE=orukeet-v${{ steps.version.outputs.model_version }}.nemo
+          build-args: ${{ steps.version.outputs.build_args }}
           # ORUKEET_REVISION and ORUKEET_SHA256 intentionally use the Dockerfile
           # defaults — they are pinned per model version in the release commit.
           # If the tag's model version doesn't match the Dockerfile pins, the
