@@ -1,0 +1,94 @@
+name: Check for new Orukeet model version
+
+# Polls HuggingFace for new Orukeet releases. Opens an issue (does NOT
+# auto-build) so a human can verify the checkpoint hash and check for
+# breaking changes before shipping a new image.
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for new model version
+        id: check
+        run: |
+          CURRENT="$(tr -d '[:space:]' < VERSION)"
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "Current built version: ${CURRENT}"
+
+          # Extract versions from .nemo checkpoint filenames on HuggingFace.
+          LATEST="$(python3 - <<'EOF'
+          import json, re, urllib.request
+
+          with urllib.request.urlopen("https://huggingface.co/api/models/oruk/orukeet") as r:
+              data = json.load(r)
+
+          versions = set()
+          for s in data.get("siblings", []):
+              m = re.search(r'orukeet-v(\d+\.\d+\.\d+)\.nemo$', s.get("rfilename", ""))
+              if m:
+                  versions.add(tuple(int(x) for x in m.group(1).split(".")))
+
+          if versions:
+              print(".".join(str(x) for x in sorted(versions)[-1]))
+          EOF
+          )"
+          echo "latest=${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "Latest on HuggingFace: ${LATEST}"
+
+          # Compare as dotted version tuples.
+          HIGHER="$(python3 -c "
+          cur = tuple(int(x) for x in '${CURRENT}'.split('.'))
+          lat = tuple(int(x) for x in '${LATEST}'.split('.'))
+          print('true' if lat > cur else 'false')
+          ")"
+          echo "newer_available=${HIGHER}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing issue
+        id: existing
+        if: steps.check.outputs.newer_available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COUNT="$(gh issue list --search "New Orukeet model version ${{ steps.check.outputs.latest }} in:title" --state open --json number --jq 'length')"
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+      - name: Open issue for new model version
+        if: steps.check.outputs.newer_available == 'true' && steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "New Orukeet model version ${{ steps.check.outputs.latest }}" \
+            --label "model-update" \
+            --body "$(cat <<'EOF'
+          HuggingFace reports Orukeet **${{ steps.check.outputs.latest }}** — newer than the currently built **${{ steps.check.outputs.current }}**.
+
+          Model page: https://huggingface.co/oruk/orukeet
+
+          ## Release checklist
+
+          - [ ] Download the new checkpoint from HuggingFace
+          - [ ] Record the pinned commit revision and SHA256
+          - [ ] Test transcription locally (does the input format still work?)
+          - [ ] Check for breaking changes (languages, API, model architecture)
+          - [ ] Update `server.py` defaults (`ORUKEET_MODEL_ID`, `ORUKEET_HF_FILE`, `ORUKEET_REVISION`, `ORUKEET_SHA256`)
+          - [ ] Update `Dockerfile` ARG defaults (same five values)
+          - [ ] Update `VERSION` file to `${{ steps.check.outputs.latest }}`
+          - [ ] Test `docker build` locally (holocron has the GPUs)
+          - [ ] `git tag v${{ steps.check.outputs.latest }} && git push origin v${{ steps.check.outputs.latest }}`
+          - [ ] CI builds and pushes `:${{ steps.check.outputs.latest }}` + updates `:latest`
+          - [ ] Verify the published image: `docker run`, hit `/health`, transcribe a test file
+
+          Do **not** skip the SHA256 verification — it's the integrity guarantee for the bundled model.
+          EOF
+          )"
